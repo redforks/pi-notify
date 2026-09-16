@@ -5,9 +5,15 @@ Pi extension that runs configured shell commands when the agent finishes or asks
 ## Language
 
 **Main agent**:
-The root pi session the user launched; the only place notifications fire.
-_Avoid_: parent session, root session, interactive session
+A pi session you launch or branch — including a `/fork` or `/clone`. The only session where notifications fire.
+_Avoid_: parent session, root session, interactive session, first session
 
 **Subagent**:
-A pi-subagents child session hosted in a process marked by `PI_SUBAGENT_CHILD=1`, where pi-notify stays fully inert.
-_Avoid_: child, child host, worker
+A pi session an agent creates to work on its behalf, whether it is hosted in the same process as its creator or in a child process.
+_Avoid_: child, child host, worker, descendant session
+
+**Lineage**:
+A session's chain of ancestry back to the session it was created from. A `/fork` and a Subagent both have non-empty Lineage, so Lineage alone never decides Main agent vs Subagent — who initiated the session does.
+
+**Subagent gate**:
+The classification every session pi-notify observes receives: Main agent, or Subagent. Detection is best-effort, so a session the gate cannot classify is a Main agent.

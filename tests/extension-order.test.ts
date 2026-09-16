@@ -20,26 +20,8 @@ vi.mock('node:child_process', () => ({
 }))
 
 import createExtension from '../src/index.js'
-
-type Handler = (event: unknown, ctx: unknown) => unknown
-
-function makeFakeAPI() {
-  const handlers = new Map<string, Handler[]>()
-  return {
-    handlers,
-    on: (event: string, handler: Handler) => {
-      const list = handlers.get(event) ?? []
-      list.push(handler)
-      handlers.set(event, list)
-    },
-  }
-}
-
-function emit(api: ReturnType<typeof makeFakeAPI>, eventName: string, event: unknown, ctx: unknown): unknown[] {
-  return (api.handlers.get(eventName) ?? []).map((h) => h(event, ctx))
-}
-
-const idleCtx = (isIdle: boolean) => ({ isIdle: () => isIdle })
+import { MAIN_AGENT_PID_ENV } from '../src/subagent-gate.js'
+import { emit, idleCtx, makeFakeAPI, sessionCtx } from './fake-host.js'
 
 function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0))
@@ -52,6 +34,7 @@ function shellCommands(): string[] {
 let homeDir: string
 let savedHome: string | undefined
 let savedUserProfile: string | undefined
+let savedMarker: string | undefined
 
 function writeConfig(contents: object) {
   mkdirSync(join(homeDir, '.pi'), { recursive: true })
@@ -62,8 +45,11 @@ beforeEach(() => {
   homeDir = mkdtempSync(join(tmpdir(), 'pi-notify-dispatch-'))
   savedHome = process.env.HOME
   savedUserProfile = process.env.USERPROFILE
+  savedMarker = process.env[MAIN_AGENT_PID_ENV]
   process.env.HOME = homeDir
   delete process.env.USERPROFILE
+  // Start each test as an unclaimed process: the factory exports this marker.
+  delete process.env[MAIN_AGENT_PID_ENV]
   harness.spawned.length = 0
   vi.spyOn(console, 'warn').mockImplementation(() => {})
 })
@@ -73,6 +59,8 @@ afterEach(() => {
   else process.env.HOME = savedHome
   if (savedUserProfile === undefined) delete process.env.USERPROFILE
   else process.env.USERPROFILE = savedUserProfile
+  if (savedMarker === undefined) delete process.env[MAIN_AGENT_PID_ENV]
+  else process.env[MAIN_AGENT_PID_ENV] = savedMarker
   vi.restoreAllMocks()
 })
 
@@ -84,7 +72,7 @@ describe('hook dispatch order onto the runner FIFO (#13)', () => {
     writeConfig({ on_ask_user: ['ask-one', 'ask-two'], on_agent_finish: ['finish-one'] })
     const api = makeFakeAPI()
     createExtension(api as never)
-    emit(api, 'ui_prompt_start', nativeAsk, {})
+    emit(api, 'ui_prompt_start', nativeAsk, sessionCtx())
     emit(api, 'agent_settled', settle, idleCtx(true))
     await flush()
     expect(shellCommands()).toEqual(['ask-one', 'ask-two', 'finish-one'])
@@ -102,7 +90,7 @@ describe('hook dispatch order onto the runner FIFO (#13)', () => {
       api,
       'tool_call',
       { type: 'tool_call', toolCallId: 'call-1', toolName: 'ask_user_question', input: {} },
-      {},
+      sessionCtx(),
     )
     emit(api, 'agent_settled', settle, idleCtx(true))
     await flush()
@@ -114,7 +102,7 @@ describe('hook dispatch order onto the runner FIFO (#13)', () => {
     const api = makeFakeAPI()
     createExtension(api as never)
     emit(api, 'agent_settled', settle, idleCtx(true))
-    emit(api, 'ui_prompt_start', nativeAsk, {})
+    emit(api, 'ui_prompt_start', nativeAsk, sessionCtx())
     await flush()
     expect(shellCommands()).toEqual(['finish-one', 'ask-one'])
   })

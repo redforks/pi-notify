@@ -1,43 +1,20 @@
+import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest'
 
-import createExtension, { SUBAGENT_CHILD_ENV } from '../src/index.js'
+import createExtension from '../src/index.js'
+import { MAIN_AGENT_PID_ENV, type SessionStartReason } from '../src/subagent-gate.js'
+import { type FakeAPI, emit, exitedPid, idleCtx, makeFakeAPI, sessionCtx, waitUntil } from './fake-host.js'
 
-type Handler = (event: unknown, ctx: unknown) => unknown
-
-interface FakeAPI {
-  handlers: Map<string, Handler[]>
-  on: (event: string, handler: Handler) => void
-}
-
-function makeFakeAPI(): FakeAPI {
-  const handlers = new Map<string, Handler[]>()
-  return {
-    handlers,
-    on: (event: string, handler: Handler) => {
-      const list = handlers.get(event) ?? []
-      list.push(handler)
-      handlers.set(event, list)
-    },
-  }
-}
-
-function emit(api: FakeAPI, eventName: string, event: unknown, ctx: unknown): unknown[] {
-  return (api.handlers.get(eventName) ?? []).map((h) => h(event, ctx))
-}
-
-function idleCtx(isIdle: boolean) {
-  return { isIdle: () => isIdle }
-}
-
-async function waitUntil(cond: () => boolean, timeoutMs = 5000): Promise<void> {
-  const start = Date.now()
-  while (!cond()) {
-    if (Date.now() - start > timeoutMs) throw new Error('waitUntil timed out')
-    await new Promise((r) => setTimeout(r, 25))
-  }
+const sessionStart = (reason: SessionStartReason) => ({ type: 'session_start', reason })
+const askEvent = { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'select' }
+const toolCallEvent = {
+  type: 'tool_call',
+  toolCallId: 'call-gate',
+  toolName: 'ask_user_question',
+  input: {},
 }
 
 // Appends `byte` to `marker` only once the marker already holds `n` bytes, so
@@ -52,6 +29,7 @@ function appendAfter(marker: string, byte: string, n: number): string {
 let homeDir: string
 let savedHome: string | undefined
 let savedUserProfile: string | undefined
+let savedMarker: string | undefined
 
 function writeConfig(contents: string | object) {
   mkdirSync(join(homeDir, '.pi'), { recursive: true })
@@ -65,8 +43,12 @@ beforeEach(() => {
   homeDir = mkdtempSync(join(tmpdir(), 'pi-notify-home-'))
   savedHome = process.env.HOME
   savedUserProfile = process.env.USERPROFILE
+  savedMarker = process.env[MAIN_AGENT_PID_ENV]
   process.env.HOME = homeDir
   delete process.env.USERPROFILE
+  // Each test starts as an unclaimed process; the gate exports this marker at
+  // load, so a stale value would make the next factory look like a reload.
+  delete process.env[MAIN_AGENT_PID_ENV]
   vi.spyOn(console, 'warn').mockImplementation(() => {})
 })
 
@@ -75,6 +57,8 @@ afterEach(() => {
   else process.env.HOME = savedHome
   if (savedUserProfile === undefined) delete process.env.USERPROFILE
   else process.env.USERPROFILE = savedUserProfile
+  if (savedMarker === undefined) delete process.env[MAIN_AGENT_PID_ENV]
+  else process.env[MAIN_AGENT_PID_ENV] = savedMarker
   vi.restoreAllMocks()
 })
 
@@ -196,11 +180,18 @@ describe('config validation (fail-loud)', () => {
     ['unknown key alongside valid', { on_agent_finish: [], extra: [] }, 'extra'],
   ])('%s throws naming the file and reason', (_label, body, fragment) => {
     writeConfig(body as never)
-    const api = makeFakeAPI()
-    expect(() => createExtension(api as never)).toThrowError(
+    // The factory subscribes first; the loud failure belongs to the first Main
+    // session, so each assertion drives a fresh, unclaimed extension.
+    const trigger = () => {
+      delete process.env[MAIN_AGENT_PID_ENV]
+      const api = makeFakeAPI()
+      expect(() => createExtension(api as never)).not.toThrow()
+      emit(api, 'session_start', sessionStart('startup'), sessionCtx())
+    }
+    expect(trigger).toThrowError(
       expect.objectContaining({ message: expect.stringContaining('pi-notify.json') }),
     )
-    expect(() => createExtension(api as never)).toThrowError(
+    expect(trigger).toThrowError(
       expect.objectContaining({ message: expect.stringContaining(fragment) }),
     )
   })
@@ -215,11 +206,14 @@ describe('config validation (fail-loud)', () => {
     expect(console.warn).not.toHaveBeenCalled()
   })
 
-  it('a failed load subscribes nothing, so pi continues without pi-notify', () => {
+  it('a failed load leaves the extension inert instead of re-throwing', () => {
     writeConfig('{not json,')
     const api = makeFakeAPI()
-    expect(() => createExtension(api as never)).toThrow()
-    expect(api.handlers.size).toBe(0)
+    expect(() => createExtension(api as never)).not.toThrow()
+    expect(() => emit(api, 'session_start', sessionStart('startup'), sessionCtx())).toThrow()
+    expect(() => emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true))).not.toThrow()
+    expect(() => emit(api, 'ui_prompt_start', askEvent, sessionCtx())).not.toThrow()
+    expect(() => emit(api, 'tool_call', toolCallEvent, sessionCtx())).not.toThrow()
   })
 
   it('partial configs load: only the configured hook fires', async () => {
@@ -231,13 +225,14 @@ describe('config validation (fail-loud)', () => {
     await waitUntil(() => existsSync(marker))
   })
 
-  it('config is read once at load: later file changes are never reloaded', async () => {
+  it('config is read once, at the first Main session: later file changes are never reloaded', async () => {
     const markerA = join(homeDir, 'first.txt')
     const markerB = join(homeDir, 'second.txt')
     writeConfig({ on_agent_finish: [`printf a > '${markerA}'`] })
     const api = makeFakeAPI()
     createExtension(api as never)
-    // Rewrite the config after load; the extension must keep the old snapshot.
+    emit(api, 'session_start', sessionStart('startup'), sessionCtx())
+    // Rewrite the config after the read; the extension must keep the old snapshot.
     writeConfig({ on_agent_finish: [`printf b > '${markerB}'`] })
     emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true))
     await waitUntil(() => existsSync(markerA))
@@ -357,7 +352,7 @@ describe('native ask-user hook', () => {
     writeConfig({ on_ask_user: [appendAfter(marker, 'a', 0), appendAfter(marker, 'b', 1)] })
     const api = makeFakeAPI()
     createExtension(api as never)
-    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind }, {})
+    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind }, sessionCtx())
     await waitUntil(() => existsSync(marker) && readFileSync(marker, 'utf8') === 'ab')
   })
 
@@ -366,9 +361,9 @@ describe('native ask-user hook', () => {
     writeConfig({ on_ask_user: [`printf 'x' >> '${marker}'`] })
     const api = makeFakeAPI()
     createExtension(api as never)
-    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'select' }, {})
+    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'select' }, sessionCtx())
     await waitUntil(() => existsSync(marker))
-    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'input' }, {})
+    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'input' }, sessionCtx())
     await waitUntil(() => readFileSync(marker, 'utf8') === 'xx')
   })
 
@@ -379,9 +374,9 @@ describe('native ask-user hook', () => {
     createExtension(api as never)
     // The host coalesces nested/overlapping prompts into a single outer
     // ui_prompt_start; the extension fires once per observed start.
-    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'select' }, {})
+    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'select' }, sessionCtx())
     await waitUntil(() => existsSync(marker))
-    emit(api, 'ui_prompt_end', { type: 'ui_prompt_end', reason: 'ui_prompt', kind: 'select' }, {})
+    emit(api, 'ui_prompt_end', { type: 'ui_prompt_end', reason: 'ui_prompt', kind: 'select' }, sessionCtx())
     await new Promise((r) => setTimeout(r, 300))
     expect(readFileSync(marker, 'utf8')).toBe('x')
   })
@@ -398,7 +393,7 @@ describe('native ask-user hook', () => {
     writeConfig({ on_ask_user: [], on_agent_finish: [`printf x > '${marker}'`] })
     const api = makeFakeAPI()
     createExtension(api as never)
-    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'confirm' }, {})
+    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'confirm' }, sessionCtx())
     await new Promise((r) => setTimeout(r, 300))
     expect(existsSync(marker)).toBe(false)
     expect(console.warn).not.toHaveBeenCalled()
@@ -423,7 +418,7 @@ describe('extra ask-tool hook (#12)', () => {
   it('an exact tool_call match runs on_ask_user once and never blocks', async () => {
     const marker = join(homeDir, 'ask.txt')
     const api = setup(['ask_user_question'], [`printf fired > '${marker}'`])
-    const results = emit(api, 'tool_call', toolCall('ask_user_question'), {})
+    const results = emit(api, 'tool_call', toolCall('ask_user_question'), sessionCtx())
     expect(results).toEqual([undefined])
     await waitUntil(() => existsSync(marker))
     expect(readFileSync(marker, 'utf8')).toBe('fired')
@@ -438,7 +433,7 @@ describe('extra ask-tool hook (#12)', () => {
   ])('near-miss %s fires nothing', async (_label, toolName) => {
     const marker = join(homeDir, 'near-miss.txt')
     const api = setup(['ask_user_question'], [`printf x > '${marker}'`])
-    emit(api, 'tool_call', toolCall(toolName), {})
+    emit(api, 'tool_call', toolCall(toolName), sessionCtx())
     await new Promise((r) => setTimeout(r, 300))
     expect(existsSync(marker)).toBe(false)
   })
@@ -452,7 +447,7 @@ describe('extra ask-tool hook (#12)', () => {
   it('a duplicate tool-name entry still fires exactly once per call', async () => {
     const marker = join(homeDir, 'dup.txt')
     const api = setup(['ask_user_question', 'ask_user_question'], [`printf x >> '${marker}'`])
-    emit(api, 'tool_call', toolCall('ask_user_question'), {})
+    emit(api, 'tool_call', toolCall('ask_user_question'), sessionCtx())
     await waitUntil(() => existsSync(marker))
     await new Promise((r) => setTimeout(r, 300))
     expect(readFileSync(marker, 'utf8')).toBe('x')
@@ -461,15 +456,15 @@ describe('extra ask-tool hook (#12)', () => {
   it('two separate matching calls fire twice', async () => {
     const marker = join(homeDir, 'twice.txt')
     const api = setup(['ask_user_question'], [`printf x >> '${marker}'`])
-    emit(api, 'tool_call', toolCall('ask_user_question'), {})
-    emit(api, 'tool_call', { ...toolCall('ask_user_question'), toolCallId: 'call-2' }, {})
+    emit(api, 'tool_call', toolCall('ask_user_question'), sessionCtx())
+    emit(api, 'tool_call', { ...toolCall('ask_user_question'), toolCallId: 'call-2' }, sessionCtx())
     await waitUntil(() => existsSync(marker) && readFileSync(marker, 'utf8') === 'xx')
   })
 
   it('nothing fires when extra_ask_user_tool is empty', async () => {
     const marker = join(homeDir, 'empty-tools.txt')
     const api = setup([], [`printf x > '${marker}'`])
-    emit(api, 'tool_call', toolCall('ask_user_question'), {})
+    emit(api, 'tool_call', toolCall('ask_user_question'), sessionCtx())
     await new Promise((r) => setTimeout(r, 300))
     expect(existsSync(marker)).toBe(false)
   })
@@ -504,7 +499,7 @@ describe('overlap ordering (#13)', () => {
       [appendAfter(marker, '1', 0), appendAfter(marker, '2', 1)],
       [appendAfter(marker, '3', 2), appendAfter(marker, '4', 3)],
     )
-    emit(api, 'ui_prompt_start', nativeAsk, {})
+    emit(api, 'ui_prompt_start', nativeAsk, sessionCtx())
     emit(api, 'agent_settled', settle, idleCtx(true))
     await waitUntil(() => existsSync(marker) && readFileSync(marker, 'utf8') === '1234')
   })
@@ -516,7 +511,7 @@ describe('overlap ordering (#13)', () => {
       [appendAfter(marker, 'f', 1)],
       ['ask_user_question'],
     )
-    emit(api, 'tool_call', toolAsk, {})
+    emit(api, 'tool_call', toolAsk, sessionCtx())
     emit(api, 'agent_settled', settle, idleCtx(true))
     await waitUntil(() => existsSync(marker) && readFileSync(marker, 'utf8') === 'af')
   })
@@ -528,7 +523,7 @@ describe('overlap ordering (#13)', () => {
       [`printf asked > '${askMarker}'`],
       [`printf finished > '${finishMarker}'`],
     )
-    emit(api, 'ui_prompt_start', nativeAsk, {})
+    emit(api, 'ui_prompt_start', nativeAsk, sessionCtx())
     emit(api, 'agent_settled', settle, idleCtx(true))
     await waitUntil(() => existsSync(askMarker) && existsSync(finishMarker))
     expect(readFileSync(askMarker, 'utf8')).toBe('asked')
@@ -542,7 +537,7 @@ describe('overlap ordering (#13)', () => {
       [appendAfter(marker, '1', 0), appendAfter(marker, '2', 1)],
     )
     emit(api, 'agent_settled', settle, idleCtx(true))
-    emit(api, 'ui_prompt_start', nativeAsk, {})
+    emit(api, 'ui_prompt_start', nativeAsk, sessionCtx())
     await waitUntil(() => existsSync(marker) && readFileSync(marker, 'utf8') === '1234')
   })
 
@@ -554,7 +549,7 @@ describe('overlap ordering (#13)', () => {
       [`printf asked > '${askMarker}'`],
       [`printf finished > '${finishMarker}'`],
     )
-    emit(api, 'ui_prompt_start', nativeAsk, {})
+    emit(api, 'ui_prompt_start', nativeAsk, sessionCtx())
     emit(api, 'agent_settled', settle, idleCtx(false))
     await waitUntil(() => existsSync(askMarker))
     await new Promise((r) => setTimeout(r, 300))
@@ -562,20 +557,26 @@ describe('overlap ordering (#13)', () => {
   })
 })
 
-describe('subagent gate (pi-subagents child host)', () => {
-  let savedChild: string | undefined
+describe('subagent gate (#15)', () => {
+  let foreign: ChildProcess | undefined
+  let foreignPid = 0
 
-  beforeEach(() => {
-    savedChild = process.env[SUBAGENT_CHILD_ENV]
+  beforeAll(async () => {
+    foreign = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    const child = foreign
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', () => resolve())
+      child.once('error', reject)
+    })
+    foreignPid = child.pid as number
   })
 
-  afterEach(() => {
-    if (savedChild === undefined) delete process.env[SUBAGENT_CHILD_ENV]
-    else process.env[SUBAGENT_CHILD_ENV] = savedChild
+  afterAll(() => {
+    foreign?.kill('SIGKILL')
   })
 
-  it('CHILD=1 subscribes to nothing and fires nothing, even with a valid config', async () => {
-    process.env[SUBAGENT_CHILD_ENV] = '1'
+  it('an inherited live marker subscribes nothing, fires nothing and never reads config', async () => {
+    process.env[MAIN_AGENT_PID_ENV] = String(foreignPid)
     const marker = join(homeDir, 'subagent-silent.txt')
     writeConfig({
       on_agent_finish: [`printf x > '${marker}'`],
@@ -585,16 +586,17 @@ describe('subagent gate (pi-subagents child host)', () => {
     const api = makeFakeAPI()
     expect(() => createExtension(api as never)).not.toThrow()
     expect(api.handlers.size).toBe(0)
+    emit(api, 'session_start', sessionStart('startup'), sessionCtx())
     emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true))
-    emit(api, 'ui_prompt_start', { type: 'ui_prompt_start', reason: 'ui_prompt', kind: 'select' }, {})
-    emit(api, 'tool_call', { type: 'tool_call', toolCallId: 'c1', toolName: 'ask_user_question', input: {} }, {})
+    emit(api, 'ui_prompt_start', askEvent, sessionCtx())
+    emit(api, 'tool_call', toolCallEvent, sessionCtx())
     await new Promise((r) => setTimeout(r, 300))
     expect(existsSync(marker)).toBe(false)
     expect(console.warn).not.toHaveBeenCalled()
   })
 
-  it('CHILD=1 never reads config: a present-but-invalid file stays silent', () => {
-    process.env[SUBAGENT_CHILD_ENV] = '1'
+  it('an inherited live marker keeps a present-but-invalid config silent', () => {
+    process.env[MAIN_AGENT_PID_ENV] = String(foreignPid)
     writeConfig('{not json,')
     const api = makeFakeAPI()
     expect(() => createExtension(api as never)).not.toThrow()
@@ -602,14 +604,88 @@ describe('subagent gate (pi-subagents child host)', () => {
     expect(console.warn).not.toHaveBeenCalled()
   })
 
-  it.each([['unset', undefined], ['empty', ''], ['zero', '0'], ['true-word', 'true']])(
-    'CHILD=%s still loads normally (exact "1" match only)',
-    (_label, value) => {
-      if (value === undefined) delete process.env[SUBAGENT_CHILD_ENV]
-      else process.env[SUBAGENT_CHILD_ENV] = value
+  it('a dead marker is reclaimed: the process claims Main and notifies again', async () => {
+    process.env[MAIN_AGENT_PID_ENV] = String(await exitedPid())
+    const marker = join(homeDir, 'reclaimed.txt')
+    writeConfig({ on_agent_finish: [`printf x > '${marker}'`] })
+    const api = makeFakeAPI()
+    createExtension(api as never)
+    expect(process.env[MAIN_AGENT_PID_ENV]).toBe(String(process.pid))
+    emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true))
+    await waitUntil(() => existsSync(marker))
+  })
+
+  it("this process's own marker (the /reload case) keeps notifying", async () => {
+    process.env[MAIN_AGENT_PID_ENV] = String(process.pid)
+    const marker = join(homeDir, 'reload.txt')
+    writeConfig({ on_agent_finish: [`printf x > '${marker}'`] })
+    const api = makeFakeAPI()
+    createExtension(api as never)
+    emit(api, 'session_start', sessionStart('reload'), sessionCtx())
+    emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true))
+    await waitUntil(() => existsSync(marker))
+  })
+
+  it('an in-process Subagent session is inert while the Main agent notifies', async () => {
+    const finishMarker = join(homeDir, 'main-finish.txt')
+    const askMarker = join(homeDir, 'main-ask.txt')
+    writeConfig({
+      on_agent_finish: [`printf x > '${finishMarker}'`],
+      on_ask_user: [`printf y > '${askMarker}'`],
+      extra_ask_user_tool: ['ask_user_question'],
+    })
+    const api = makeFakeAPI()
+    createExtension(api as never)
+    emit(api, 'session_start', sessionStart('startup'), sessionCtx('main'))
+    emit(api, 'session_start', sessionStart('startup'), sessionCtx('subagent'))
+
+    emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true, 'subagent'))
+    emit(api, 'ui_prompt_start', askEvent, sessionCtx('subagent'))
+    emit(api, 'tool_call', toolCallEvent, sessionCtx('subagent'))
+    await new Promise((r) => setTimeout(r, 300))
+    expect(existsSync(finishMarker)).toBe(false)
+    expect(existsSync(askMarker)).toBe(false)
+
+    emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true, 'main'))
+    emit(api, 'ui_prompt_start', askEvent, sessionCtx('main'))
+    await waitUntil(() => existsSync(finishMarker) && existsSync(askMarker))
+  })
+
+  it.each(['reload', 'new', 'resume', 'fork'] as const)(
+    'a %s session is a Main agent and notifies',
+    async (reason) => {
+      const marker = join(homeDir, `driven-${reason}.txt`)
+      writeConfig({ on_agent_finish: [`printf x > '${marker}'`] })
       const api = makeFakeAPI()
-      expect(() => createExtension(api as never)).not.toThrow()
-      expect(api.handlers.get('agent_settled')).toHaveLength(1)
+      createExtension(api as never)
+      emit(api, 'session_start', sessionStart('startup'), sessionCtx('main'))
+      emit(api, 'session_start', sessionStart(reason), sessionCtx(`driven-${reason}`))
+      emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true, `driven-${reason}`))
+      await waitUntil(() => existsSync(marker))
     },
   )
+
+  it('the first session to emit an event is Main when session_start never arrives', async () => {
+    const marker = join(homeDir, 'lazy.txt')
+    writeConfig({ on_agent_finish: [`printf x > '${marker}'`] })
+    const api = makeFakeAPI()
+    createExtension(api as never)
+    emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true, 'never-announced'))
+    await waitUntil(() => existsSync(marker))
+  })
+
+  it('a Subagent session never reads the config: a malformed file stays silent', () => {
+    // The process already claimed a Main agent (as after `/reload`), so an
+    // in-process Subagent's `startup` session_start must not touch the config.
+    process.env[MAIN_AGENT_PID_ENV] = String(process.pid)
+    writeConfig('{not json,')
+    const api = makeFakeAPI()
+    createExtension(api as never)
+    expect(() =>
+      emit(api, 'session_start', sessionStart('startup'), sessionCtx('subagent')),
+    ).not.toThrow()
+    expect(() =>
+      emit(api, 'agent_settled', { type: 'agent_settled' }, idleCtx(true, 'subagent')),
+    ).not.toThrow()
+  })
 })
