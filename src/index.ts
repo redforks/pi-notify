@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-a
 
 import { loadConfig } from './config.js'
 import { runCommands } from './runner.js'
+import { hasActiveSubagents } from './active-subagents.js'
 import { isProcessAlive, openMainAgentGate } from './subagent-gate.js'
 /**
  * Subagent gate (ticket #15).
@@ -91,6 +92,9 @@ export default function (pi: ExtensionAPI): void {
   pi.on('agent_settled', (_event, ctx) => {
     const config = mainHooks(ctx)
     if (config === undefined || !ctx.isIdle()) return
+    // Hold Finished while Active subagents exist (ADR 0002): suppress this
+    // fire; the Main agent resumes on completion and settles again.
+    if (hasActiveSubagents()) return
     runCommands(config.on_agent_finish)
   })
 

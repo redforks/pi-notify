@@ -8,7 +8,7 @@ Observer-only with respect to events: it never blocks a tool call, never returns
 
 | Hook | Fires when | Subscribed event |
 | --- | --- | --- |
-| `on_agent_finish` | pi has **actually settled** — idle, nothing queued, no auto-retry or auto-compact still pending. Never the intermediate `agent_end`. | `agent_settled`, and only while `ctx.isIdle()` is true |
+| `on_agent_finish` | pi has **actually settled** — idle, nothing queued, no auto-retry or auto-compact still pending. Never the intermediate `agent_end`. Held while an Active subagent exists (see [Subagents](#subagents)). | `agent_settled`, and only while `ctx.isIdle()` is true |
 | `on_ask_user` | pi is **waiting on you** — once per native prompt (`select`, `confirm`, `input`, `editor`, `custom`), and at call-start for every tool call whose exact name is in `extra_ask_user_tool`. | `ui_prompt_start` (the host's coalesced outer waiting span, so nested/overlapping prompts notify once) and `tool_call` |
 
 `on_agent_finish` still fires in non-interactive mode; the ask paths are inert there (see [Non-interactive mode](#non-interactive-mode)).
